@@ -1,19 +1,26 @@
 #!/bin/bash
 
 # The screensaver launcher must identify an existing screensaver by its exact
-# Hyprland window class. Process command lines can collide with unrelated
-# programs, while Linux process names are truncated to 15 characters.
+# Hyprland window class or real script process. Run jq, pidof and flock, not
+# substitutes: argv decoys and Linux comm truncation caused the original bug.
 
 set -euo pipefail
 
 source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/base-test.sh"
 
 require_command jq
+require_command pidof
+require_command flock
 
 launcher="$ROOT/bin/omarchy-launch-screensaver"
 tmp=$(mktemp -d)
 
+process_pid=""
 cleanup() {
+  if [[ -n $process_pid ]]; then
+    kill "$process_pid" 2>/dev/null || true
+    wait "$process_pid" 2>/dev/null || true
+  fi
   rm -rf "$tmp"
 }
 trap cleanup EXIT
@@ -71,6 +78,7 @@ run_launcher() {
   OMARCHY_TEST_CLIENTS_JSON="$clients_json" \
     OMARCHY_TEST_HYPRCTL_LOG="$hyprctl_log" \
     OMARCHY_TEST_HELPER_LOG="$helper_log" \
+    XDG_RUNTIME_DIR="$tmp" \
     PATH="$tmp:$PATH" \
     "$launcher" 2>&1
 }
@@ -113,7 +121,55 @@ set -e
   fail "non-matching clients continue past the window gate" "helper calls: $(<"$helper_log")"
 pass "non-matching clients continue past the window gate"
 
-if grep -Eq 'pgrep[[:space:]]+(-f|-x)' "$launcher"; then
-  fail "launcher no longer relies on process matching for the running check"
-fi
-pass "launcher no longer relies on process matching for the running check"
+# Use a real bash script with the long filename, not a stubbed process finder.
+# Blocking on a FIFO keeps the script itself alive without orphan sleep jobs.
+mkfifo "$tmp/process-input"
+cat >"$tmp/omarchy-screensaver" <<'SH'
+#!/bin/bash
+exec 3<>"${OMARCHY_TEST_PROCESS_INPUT:?}"
+printf 'ready\n' >"${OMARCHY_TEST_PROCESS_READY:?}"
+read -r -u 3
+SH
+chmod +x "$tmp/omarchy-screensaver"
+
+start_process() {
+  local script="$1"
+  shift
+  rm -f "$tmp/process-ready"
+  OMARCHY_TEST_PROCESS_INPUT="$tmp/process-input" \
+    OMARCHY_TEST_PROCESS_READY="$tmp/process-ready" "$script" "$@" &
+  process_pid=$!
+  for ((attempt = 0; attempt < 100; attempt++)); do
+    [[ -s $tmp/process-ready ]] && return 0
+    sleep 0.02
+  done
+  fail "real process fixture starts"
+}
+
+cp "$tmp/omarchy-screensaver" "$tmp/decoy"
+start_process "$tmp/decoy" org.omarchy.screensaver omarchy-screensaver
+set +e
+output=$(run_launcher '[]')
+rc=$?
+set -e
+((rc == 1)) && [[ $(<"$helper_log") == $'toggle\nfocused\nterminal\nnotification' ]] ||
+  fail "real argv decoy does not block launching" "rc=$rc output=$output"
+pass "real argv decoy does not block launching"
+kill "$process_pid"
+wait "$process_pid" 2>/dev/null || true
+process_pid=""
+
+start_process "$tmp/omarchy-screensaver"
+assert_existing_screensaver_exits_early '[]' \
+  "real bash screensaver blocks launching before any window maps"
+kill "$process_pid"
+wait "$process_pid" 2>/dev/null || true
+process_pid=""
+
+set +e
+output=$(run_launcher '[]')
+rc=$?
+set -e
+((rc == 1)) && [[ -s $helper_log ]] ||
+  fail "exited screensaver does not leave a stale process or lock gate" "rc=$rc output=$output"
+pass "exited screensaver does not leave a stale process or lock gate"

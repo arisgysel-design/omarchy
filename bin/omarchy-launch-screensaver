@@ -2,10 +2,15 @@
 
 # omarchy:summary=Launch the Omarchy screensaver in the default terminal on the system with the correct font configuration.
 
-# Exit early if a real screensaver window is already running. Match the exact
-# Hyprland class instead of process arguments or Linux's truncated process name.
+# Serialize the check and async launch, including the wait for windows to map.
+# Keep the lock file: unlinking it would let callers lock different inodes.
+exec {launch_lock}>"$XDG_RUNTIME_DIR/omarchy-screensaver.lock" || exit 1
+flock -n "$launch_lock" || exit 0
+
+# Match actual windows or scripts, not arbitrary argv or truncated comm names.
 hyprctl clients -j 2>/dev/null |
   jq -e 'any(.[]; .class == "org.omarchy.screensaver" or .initialClass == "org.omarchy.screensaver")' >/dev/null && exit 0
+pidof -x omarchy-screensaver >/dev/null && exit 0
 
 # Allow screensaver to be turned off but also force started
 if omarchy-toggle-enabled screensaver-off && [[ $1 != "force" ]]; then
@@ -38,7 +43,8 @@ SOCKET="$XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/.socket2.sock"
 
 # Open Hyprland's event stream before spawning anything, so a terminal that maps
 # quickly can't emit its openwindow event before we are listening for it.
-exec {events}< <(socat -U - "UNIX-CONNECT:$SOCKET")
+# The event reader must not retain the launch lock after the launcher exits.
+exec {events}< <(socat -U - "UNIX-CONNECT:$SOCKET" {launch_lock}>&-)
 
 # hypr_exec is async and a new window maps on whatever monitor is focused at that
 # moment. Block until this monitor's screensaver actually opens before moving
